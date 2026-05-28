@@ -1,0 +1,3 @@
+INFO:     Will watch for changes in these directories: ['C:\\Users\\marts\\Documents\\10_IAAC\\3_third term\\Programming for AI\\Treeat\\treeroute\\backend']
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [43696] using StatReload

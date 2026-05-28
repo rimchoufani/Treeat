@@ -6,3 +6,5 @@ osmnx
 geopandas
 networkx
 requests
+httpx
+reportlab
