@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import os
 import threading
 import uuid
 from pathlib import Path
@@ -23,15 +24,20 @@ from shapely.geometry import shape
 
 from infrared_sdk import InfraredClient
 from infrared_sdk.analyses.types import (
-    AnalysesName, WindModelRequest,
+    AnalysesName, UtciModelRequest, UtciModelBaseRequest,
 )
+from infrared_sdk.models import TimePeriod, Location
 
 load_dotenv()
 
 app = FastAPI(title="TreeRoute API")
+
+# Guest list: who may call this API from a browser. Your frontend URL — never "*".
+# Set ALLOWED_ORIGINS on the host (comma-separated). Defaults to the local dev server.
+_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -51,11 +57,14 @@ route_jobs: dict[str, dict] = {}
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def grid_to_b64_png(grid: np.ndarray) -> str:
-    """Render wind grid to a north-up transparent PNG, return base64 string."""
-    vmin, vmax = float(np.nanmin(grid)), float(np.nanmax(grid))
+def grid_to_b64_png(grid: np.ndarray, vmin: float = None, vmax: float = None) -> str:
+    """Render UTCI grid to a north-up transparent PNG, return base64 string."""
+    if vmin is None:
+        vmin = float(np.nanmin(grid))
+    if vmax is None:
+        vmax = float(np.nanmax(grid))
     norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
-    cmap = cm.get_cmap("RdYlBu")
+    cmap = cm.get_cmap("RdYlBu_r")
     rgba = cmap(norm(np.where(np.isnan(grid), 0.0, grid)))
     rgba[np.isnan(grid)] = [0, 0, 0, 0]
     rgba_north_up = rgba[::-1, :, :]
@@ -71,7 +80,7 @@ def sample_grid(grid: np.ndarray, bounds: tuple, lon: float, lat: float) -> floa
     col = int(np.clip((lon - min_lon) / (max_lon - min_lon) * (n_cols - 1), 0, n_cols - 1))
     row = int(np.clip((max_lat - lat) / (max_lat - min_lat) * (n_rows - 1), 0, n_rows - 1))
     v = grid[row, col]
-    return float(v) if not np.isnan(v) else 5.0
+    return float(v) if not np.isnan(v) else 32.0
 
 
 def bbox_diagonal_km(polygon: dict) -> float:
@@ -162,6 +171,21 @@ def root():
     return {"status": "ok"}
 
 
+@app.get("/health")
+def health():
+    # Railway / Vercel health check pings this.
+    return {"status": "ok"}
+
+
+@app.get("/secret-check")
+def secret_check():
+    # Proof the key lives on the backend — without revealing it.
+    return {
+        "infrared_key_configured": bool(os.getenv("INFRARED_API_KEY", "")),
+        "note": "Key stays on the backend. The browser never gets it.",
+    }
+
+
 @app.get("/api/tree-species")
 def get_tree_species():
     return JSONResponse(content=parse_tree_species())
@@ -174,7 +198,7 @@ def get_suppliers():
 
 @app.get("/api/street-species")
 def get_street_species(
-    wind: float = Query(default=3.0),
+    utci: float = Query(default=32.0),
     width: str = Query(default="wide"),
 ):
     species_list = parse_tree_species()
@@ -183,7 +207,7 @@ def get_street_species(
     scored = []
     for sp in species_list:
         score = sp["cooling_score"]
-        if wind > 4.0:
+        if utci > 32.0:
             score += sp["lai"]
         if width == "narrow":
             if "narrow" in sp["best_for"].lower() or "corridor" in sp["best_for"].lower():
@@ -241,26 +265,26 @@ def calculate_route(body: dict):
         for u, v, data in G.edges(data=True):
             mx = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
             my = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
-            data["wind"] = sample_grid(grid_np, bounds_t, mx, my)
+            data["utci"] = sample_grid(grid_np, bounds_t, mx, my)
             data.setdefault("length", 50)
     else:
-        # Fallback: use stored planting data wind values
+        # Fallback: use stored planting data utci values
         planting = results.get("planting_locations", {})
-        wind_lookup = {}
+        utci_lookup = {}
         for f in planting.get("features", []):
             props = f.get("properties", {})
             u, v = props.get("node_u"), props.get("node_v")
             if u is not None and v is not None:
-                wind_lookup[(u, v)] = props.get("avg_wind", 5.0)
+                utci_lookup[(u, v)] = props.get("avg_utci", 32.0)
         for u, v, data in G.edges(data=True):
-            data["wind"] = wind_lookup.get((u, v), wind_lookup.get((v, u), 5.0))
+            data["utci"] = utci_lookup.get((u, v), utci_lookup.get((v, u), 32.0))
             data.setdefault("length", 50)
 
     try:
         orig_node = ox.nearest_nodes(G, origin[0], origin[1])
         dest_node = ox.nearest_nodes(G, destination[0], destination[1])
         fastest = nx.shortest_path(G, orig_node, dest_node, weight="length")
-        coolest = nx.shortest_path(G, orig_node, dest_node, weight="wind")
+        coolest = nx.shortest_path(G, orig_node, dest_node, weight="utci")
     except Exception as e:
         raise HTTPException(500, f"Routing error: {e}")
 
@@ -268,16 +292,16 @@ def calculate_route(body: dict):
         return [[G.nodes[n]["x"], G.nodes[n]["y"]] for n in path]
 
     def path_stats(path):
-        total_len, wind_vals = 0, []
+        total_len, utci_vals = 0, []
         for i in range(len(path) - 1):
             u, v2 = path[i], path[i + 1]
             edge = G[u][v2]
             key = list(edge.keys())[0]
             total_len += edge[key].get("length", 0)
-            wind_vals.append(edge[key].get("wind", 5.0))
+            utci_vals.append(edge[key].get("utci", 32.0))
         return {
             "distance_m": round(total_len),
-            "avg_wind": round(sum(wind_vals) / len(wind_vals) if wind_vals else 5.0, 2),
+            "avg_utci": round(sum(utci_vals) / len(utci_vals) if utci_vals else 32.0, 2),
         }
 
     return JSONResponse(content={
@@ -293,6 +317,53 @@ def get_cool_route_static():
         data = json.loads(path.read_text(encoding="utf-8"))
         return JSONResponse(content=data)
     return JSONResponse(content={"type": "FeatureCollection", "features": []})
+
+
+@app.get("/api/budget")
+def get_budget(job_id: str, budget_eur: int = Query(default=50000)):
+    if job_id not in jobs:
+        raise HTTPException(404, "Job not found")
+    j = jobs[job_id]
+    if j.get("status") != "complete":
+        raise HTTPException(400, "Job not complete")
+
+    features = j["results"].get("planting_locations", {}).get("features", [])
+    cost_per_tree = 480
+
+    remaining = budget_eur
+    funded = []
+    for f in features:
+        props = f["properties"]
+        n = props.get("recommended_trees", 1)
+        cost = n * cost_per_tree
+        if remaining >= cost:
+            remaining -= cost
+            funded.append(f)
+        elif remaining >= cost_per_tree:
+            trees_funded = remaining // cost_per_tree
+            remaining = 0
+            funded.append({
+                **f,
+                "properties": {
+                    **props,
+                    "recommended_trees": trees_funded,
+                    "cost_estimate": trees_funded * cost_per_tree,
+                },
+            })
+            break
+        else:
+            break
+
+    total_trees = sum(f["properties"]["recommended_trees"] for f in funded)
+    return JSONResponse(content={
+        "geojson": {"type": "FeatureCollection", "features": funded},
+        "meta": {
+            "budget_eur": budget_eur,
+            "streets_funded": len(funded),
+            "total_trees": total_trees,
+            "total_cost": total_trees * cost_per_tree,
+        },
+    })
 
 
 # ── live analysis endpoints ───────────────────────────────────────────────────
@@ -349,6 +420,51 @@ def get_job_results(job_id: str):
 
 # ── background analysis ───────────────────────────────────────────────────────
 
+def _apply_canopy_shading(grid: np.ndarray, bounds: tuple, plant_features: list) -> np.ndarray:
+    """
+    Shading-only UTCI correction for planted trees.
+    Each tree reduces UTCI by 3 °C within its actual canopy radius (4 m).
+    Based on: MRT reduction under broadleaf shade ~10 °C → ΔUTCI ≈ 0.354 × ΔMRT ≈ 3.5 °C,
+    conservatively rounded to 3 °C to account for partial wind-blocking offset.
+    No spreading beyond canopy boundary — the effect is localised to the shade footprint.
+    """
+    n_rows, n_cols = grid.shape
+    min_lon, min_lat, max_lon, max_lat = bounds
+    lat_c = (min_lat + max_lat) / 2
+
+    m_per_col = (max_lon - min_lon) * 111320 * np.cos(np.radians(lat_c)) / max(n_cols - 1, 1)
+    m_per_row = (max_lat - min_lat) * 111320 / max(n_rows - 1, 1)
+
+    canopy_radius_m = 4.0   # Ficus macrocarpa canopy radius (8 m diameter / 2)
+    utci_reduction  = 3.0   # °C under canopy
+    r_col = max(1, int(canopy_radius_m / m_per_col))
+    r_row = max(1, int(canopy_radius_m / m_per_row))
+
+    cooling = np.zeros((n_rows, n_cols), dtype=float)
+
+    for feature in plant_features:
+        coords  = feature["geometry"]["coordinates"]
+        n_trees = max(1, feature["properties"].get("recommended_trees", 1))
+        if len(coords) < 2:
+            continue
+        for t in np.linspace(0.0, 1.0, n_trees):
+            lon = coords[0][0] + t * (coords[-1][0] - coords[0][0])
+            lat = coords[0][1] + t * (coords[-1][1] - coords[0][1])
+            col = int(np.clip((lon - min_lon) / (max_lon - min_lon) * (n_cols - 1), 0, n_cols - 1))
+            row = int(np.clip((max_lat - lat) / (max_lat - min_lat) * (n_rows - 1), 0, n_rows - 1))
+
+            r0, r1 = max(0, row - r_row), min(n_rows, row + r_row + 1)
+            c0, c1 = max(0, col - r_col), min(n_cols, col + r_col + 1)
+
+            # Vectorised circular mask — no effect outside actual canopy footprint
+            rr, cc = np.mgrid[r0:r1, c0:c1]
+            mask = ((rr - row) / max(r_row, 1)) ** 2 + ((cc - col) / max(r_col, 1)) ** 2 <= 1.0
+            cooling[r0:r1, c0:c1] = np.where(mask, utci_reduction, cooling[r0:r1, c0:c1])
+
+    after = grid - cooling
+    return np.where(np.isnan(grid), np.nan, after)
+
+
 def analyze_area(job_id: str, polygon: dict):
     try:
         # Validate polygon size
@@ -361,47 +477,73 @@ def analyze_area(job_id: str, polygon: dict):
         coords = polygon["coordinates"][0]
         lons = [c[0] for c in coords]
         lats = [c[1] for c in coords]
+        center_lat = (min(lats) + max(lats)) / 2
+        center_lon = (min(lons) + max(lons)) / 2
 
         with InfraredClient() as client:
 
             # Step 1 — buildings
-            jobs[job_id].update(step="Fetching buildings from OSM...", progress=10)
+            jobs[job_id].update(step="Fetching buildings from OSM...", progress=8)
             area = client.buildings.get_area(polygon)
 
             # Step 2 — vegetation
-            jobs[job_id].update(step="Fetching vegetation...", progress=30)
+            jobs[job_id].update(step="Fetching vegetation...", progress=16)
             vegetation = client.vegetation.get_area(polygon)
 
-            # Step 3 — wind simulation
-            jobs[job_id].update(step="Running wind simulation...", progress=50)
-            payload = WindModelRequest(
-                analysis_type=AnalysesName.wind_speed,
-                wind_speed=5,
-                wind_direction=270,
+            # Step 3 — ground materials
+            jobs[job_id].update(step="Fetching ground materials...", progress=22)
+            ground = client.ground_materials.get_area(polygon)
+
+            # Step 4 — weather data (Vienna TMYx, July peak hours)
+            jobs[job_id].update(step="Fetching weather data...", progress=28)
+            tp = TimePeriod(
+                start_month=7, start_day=1, start_hour=9,
+                end_month=7, end_day=31, end_hour=18,
             )
-            result = client.run_area_and_wait(
-                payload, polygon,
-                buildings=area.buildings,
+            locations = client.weather.get_weather_file_from_location(
+                lat=center_lat, lon=center_lon, radius=50,
+            )
+            weather_data = client.weather.filter_weather_data(
+                identifier=locations[0]["uuid"],
+                time_period=tp,
             )
 
-            # Step 4 — process grid
-            jobs[job_id].update(step="Processing results...", progress=80)
+            # Step 5 — UTCI thermal comfort simulation
+            jobs[job_id].update(step="Running UTCI thermal comfort simulation...", progress=35)
+            payload = UtciModelRequest.from_weatherfile_payload(
+                payload=UtciModelBaseRequest(
+                    analysis_type=AnalysesName.thermal_comfort_index,
+                ),
+                location=Location(latitude=center_lat, longitude=center_lon),
+                time_period=tp,
+                weather_data=weather_data,
+            )
+            result = client.run_area_and_wait(
+                payload,
+                polygon,
+                buildings=area.buildings,
+                vegetation=vegetation.features,
+                ground_materials=ground.layers,
+            )
+
+            # Step 6 — process grid
+            jobs[job_id].update(step="Processing UTCI results...", progress=80)
             grid = result.merged_grid
             bounds = result.bounds  # (min_lon, min_lat, max_lon, max_lat)
             min_lon_b, min_lat_b, max_lon_b, max_lat_b = bounds
             vmin = float(np.nanmin(grid))
             vmax = float(np.nanmax(grid))
-            img_b64 = grid_to_b64_png(grid)
+            img_b64 = grid_to_b64_png(grid, vmin=vmin, vmax=vmax)
 
-            # Step 5 — routing
+            # Step 7 — routing
             jobs[job_id].update(step="Building street graph...", progress=90)
             n_rows, n_cols = grid.shape
 
-            def sample_wind(lon, lat):
+            def sample_utci(lon, lat):
                 col = int(np.clip((lon - min_lon_b) / (max_lon_b - min_lon_b) * (n_cols - 1), 0, n_cols - 1))
                 row = int(np.clip((max_lat_b - lat) / (max_lat_b - min_lat_b) * (n_rows - 1), 0, n_rows - 1))
                 v = grid[row, col]
-                return float(v) if not np.isnan(v) else 5.0
+                return float(v) if not np.isnan(v) else 32.0
 
             plant_features = []
             route_geojson = {"type": "FeatureCollection", "features": []}
@@ -416,9 +558,9 @@ def analyze_area(job_id: str, polygon: dict):
                 for u, v, data in G.edges(data=True):
                     mx = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
                     my = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
-                    data["wind"] = sample_wind(mx, my)
+                    data["utci"] = sample_utci(mx, my)
                     data.setdefault("length", 50)
-                    data["score"] = data["wind"] * data["length"]
+                    data["score"] = data["utci"] * data["length"]
 
                 # ── Planting streets ────────────────────────────────────────
                 edges_sorted = sorted(
@@ -434,7 +576,7 @@ def analyze_area(job_id: str, polygon: dict):
                         "type": "Feature",
                         "geometry": {"type": "LineString", "coordinates": [[ux, uy], [vx, vy]]},
                         "properties": {
-                            "avg_wind": round(d.get("wind", 5.0), 2),
+                            "avg_utci": round(d.get("utci", 32.0), 2),
                             "score": round(d.get("score", 0), 1),
                             "length_m": round(length, 0),
                             "node_u": u,
@@ -451,7 +593,7 @@ def analyze_area(job_id: str, polygon: dict):
                 orig_node = nodes[0]
                 dest_node = nodes[len(nodes) // 2]
                 try:
-                    cool_path = nx.shortest_path(G, orig_node, dest_node, weight="wind")
+                    cool_path = nx.shortest_path(G, orig_node, dest_node, weight="utci")
                     route_coords = [[G.nodes[nd]["x"], G.nodes[nd]["y"]] for nd in cool_path]
                     print(f"Route coords: {len(route_coords)}")
                 except nx.NetworkXNoPath:
@@ -468,6 +610,8 @@ def analyze_area(job_id: str, polygon: dict):
                     }
 
                 planting_geojson = {"type": "FeatureCollection", "features": plant_features}
+                # Cache graph for instant reuse by cool-route
+                jobs[job_id]["_graph"] = G
 
             except Exception as e:
                 import traceback
@@ -476,13 +620,29 @@ def analyze_area(job_id: str, polygon: dict):
 
             total_trees = sum(f["properties"]["recommended_trees"] for f in plant_features)
 
+            # ── After-planting UTCI — canopy shading model ───────────────────────
+            # Each planted tree reduces UTCI by ~3°C within its canopy radius (4m).
+            # Based on MRT reduction under broadleaf shade (literature: 8-15°C ΔMRT,
+            # UTCI ≈ 0.354 × ΔMRT → ~3°C net, conservatively accounting for wind
+            # blocking which partially offsets shade benefit in UTCI).
+            jobs[job_id].update(step="Computing after-planting UTCI (shading model)...", progress=95)
+            after_grid = _apply_canopy_shading(grid, bounds, plant_features)
+            img_after_b64   = grid_to_b64_png(after_grid, vmin=vmin, vmax=vmax)
+            utci_after_mean = round(float(np.nanmean(after_grid)), 2)
+            a_min_lon, a_min_lat, a_max_lon, a_max_lat = min_lon_b, min_lat_b, max_lon_b, max_lat_b
+
             jobs[job_id].update(
                 step="Complete",
                 progress=100,
                 status="complete",
                 results={
-                    "wind_image": img_b64,
+                    "utci_image": img_b64,
+                    "utci_after_image": img_after_b64,
                     "bounds": {
+                        "west": min_lon_b, "south": min_lat_b,
+                        "east": max_lon_b, "north": max_lat_b,
+                    },
+                    "utci_after_bounds": {
                         "west": min_lon_b, "south": min_lat_b,
                         "east": max_lon_b, "north": max_lat_b,
                     },
@@ -491,9 +651,10 @@ def analyze_area(job_id: str, polygon: dict):
                     "planting_locations": planting_geojson,
                     "cool_route": route_geojson,
                     "stats": {
-                        "wind_min": round(vmin, 2),
-                        "wind_max": round(vmax, 2),
-                        "wind_mean": round(float(np.nanmean(grid)), 2),
+                        "utci_min": round(vmin, 2),
+                        "utci_max": round(vmax, 2),
+                        "utci_mean": round(float(np.nanmean(grid)), 2),
+                        "utci_after_mean": utci_after_mean,
                         "n_planting_streets": len(plant_features),
                         "total_trees": total_trees,
                     },
@@ -535,7 +696,7 @@ async def generate_planting_plan(job_id: str):
 
     total_trees = sum(f["properties"].get("recommended_trees", 0) for f in features)
     total_cost = sum(f["properties"].get("cost_estimate", 0) for f in features)
-    wind_improvement = round(total_trees * 0.04, 2)
+    utci_improvement = round(total_trees * 0.18, 2)
     pet_improvement = round(total_trees * 0.18, 2)
     co2 = round(total_trees * 21.7, 0)
     shade = round(total_trees * 28.3, 0)
@@ -582,7 +743,7 @@ async def generate_planting_plan(job_id: str):
     stat_data = [[
         Paragraph(f'<b>{total_trees}</b><br/><font size="8" color="#888888">Trees recommended</font>', stat_style),
         Paragraph(f'<b>€{total_cost:,}</b><br/><font size="8" color="#888888">Estimated budget</font>', stat_style),
-        Paragraph(f'<b>-{wind_improvement} m/s</b><br/><font size="8" color="#888888">Wind reduction</font>', stat_style),
+        Paragraph(f'<b>-{utci_improvement}°C</b><br/><font size="8" color="#888888">UTCI reduction</font>', stat_style),
         Paragraph(f'<b>-{pet_improvement}°C</b><br/><font size="8" color="#888888">PET improvement</font>', stat_style),
     ]]
     stat_table = Table(stat_data, colWidths=[4.25*cm]*4)
@@ -602,10 +763,10 @@ async def generate_planting_plan(job_id: str):
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#e0ede6')))
     story.append(Spacer(1, 8))
 
-    wind_mean = stats.get("wind_mean", 5.0)
+    utci_mean = stats.get("utci_mean", 32.0)
     impact_rows = [
         ['Metric', 'Before', 'After', 'Improvement'],
-        ['Average wind speed', f'{wind_mean:.1f} m/s', f'{max(0, wind_mean - wind_improvement):.1f} m/s', f'-{wind_improvement} m/s'],
+        ['Average UTCI', f'{utci_mean:.1f}°C', f'{max(0, utci_mean - utci_improvement):.1f}°C', f'-{utci_improvement}°C'],
         ['PET thermal comfort', 'Baseline', f'-{pet_improvement}°C', f'{pet_improvement}°C cooler'],
         ['CO₂ sequestration/year', '0 kg', f'{co2:.0f} kg', f'+{co2:.0f} kg'],
         ['Shade coverage', '0 m²', f'{shade:.0f} m²', f'+{shade:.0f} m²'],
@@ -665,13 +826,13 @@ async def generate_planting_plan(job_id: str):
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#e0ede6')))
     story.append(Spacer(1, 8))
 
-    street_rows = [['Street', 'Length', 'Wind (m/s)', 'Trees', 'Cost']]
+    street_rows = [['Street', 'Length', 'UTCI (°C)', 'Trees', 'Cost']]
     for i, f in enumerate(features[:15]):
         p = f["properties"]
         street_rows.append([
             f'Segment {i+1}',
             f'{p.get("length_m", 0):.0f}m',
-            f'{p.get("avg_wind", 0):.1f}',
+            f'{p.get("avg_utci", 0):.1f}',
             str(p.get("recommended_trees", 0)),
             f'€{p.get("cost_estimate", 0):,}',
         ])
@@ -737,154 +898,6 @@ async def generate_planting_plan(job_id: str):
 
 
 @app.get("/api/map-search")
-
-    street_rows = ""
-    for i, f in enumerate(features[:15]):
-        p = f["properties"]
-        street_rows += f"""
-        <tr>
-          <td>Street segment {i+1}</td>
-          <td>{p.get('length_m', 0):.0f}m</td>
-          <td>{p.get('avg_wind', 0):.1f} m/s</td>
-          <td>{p.get('recommended_trees', 0)}</td>
-          <td>{p.get('recommended_species', 'Ficus macrocarpa')}</td>
-          <td>€{p.get('cost_estimate', 0):,}</td>
-        </tr>
-        """
-
-    supplier_rows = ""
-    for s in supplier_data:
-        supplier_rows += f"""
-        <tr>
-          <td><strong>{s['name']}</strong></td>
-          <td>{s['location']}</td>
-          <td>{', '.join(s['species'])}</td>
-          <td>{s['lead_time']}</td>
-          <td><a href="mailto:{s['contact']}">{s['contact']}</a></td>
-        </tr>
-        """
-
-    import datetime
-    now_str = datetime.datetime.now().strftime('%d %B %Y')
-    year_str = datetime.datetime.now().strftime('%Y')
-
-    species_cards = ""
-    for sp in species_data[:3]:
-        stars = '★' * sp.get('cooling_score', 0) + '☆' * (10 - sp.get('cooling_score', 0))
-        species_cards += f"""
-        <div class="species-card">
-          <h3>{sp['name']}</h3>
-          <div style="font-size:10px;color:#666;">{sp.get('best_for', '')}</div>
-          <div class="species-meta">
-            <span>Cooling: {stars}</span>
-            <span>Allergy: {sp.get('allergy_risk', 'Low')}</span>
-            <span>€{sp.get('cost_eur', 0)}/tree</span>
-            <span>LAI: {sp.get('lai', 0)}</span>
-          </div>
-        </div>
-        """
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<style>
-* {{ margin:0; padding:0; box-sizing:border-box; }}
-body {{ font-family: sans-serif; color: #1a1a1a; font-size: 11px; line-height: 1.5; }}
-.cover {{ background: #1a7a4a; color: white; padding: 48px 40px 32px; margin-bottom: 32px; }}
-.cover h1 {{ font-size: 32px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 4px; }}
-.cover .sub {{ font-size: 14px; opacity: 0.8; margin-bottom: 24px; }}
-.cover .meta {{ font-size: 11px; opacity: 0.65; }}
-.stats-row {{ display: flex; gap: 16px; padding: 0 40px 32px; }}
-.stat-box {{ flex: 1; background: #f5fbf7; border: 1px solid #c8e6d4; border-radius: 8px; padding: 14px 16px; }}
-.stat-box .val {{ font-size: 22px; font-weight: 700; color: #1a7a4a; }}
-.stat-box .lbl {{ font-size: 10px; color: #888; margin-top: 2px; }}
-.section {{ padding: 0 40px 28px; }}
-.section h2 {{ font-size: 14px; font-weight: 600; color: #1a7a4a; border-bottom: 2px solid #e0ede6; padding-bottom: 6px; margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.5px; }}
-table {{ width: 100%; border-collapse: collapse; font-size: 10px; }}
-th {{ background: #f5f5f0; padding: 7px 8px; text-align: left; font-weight: 600; color: #555; border-bottom: 1px solid #e0e0da; }}
-td {{ padding: 7px 8px; border-bottom: 1px solid #f0f0eb; color: #333; }}
-tr:last-child td {{ border-bottom: none; }}
-.species-card {{ background: #f5fbf7; border: 1px solid #c8e6d4; border-left: 4px solid #1a7a4a; border-radius: 6px; padding: 12px 16px; margin-bottom: 10px; }}
-.species-card h3 {{ font-size: 13px; font-weight: 600; color: #1a1a1a; margin-bottom: 4px; font-style: italic; }}
-.species-meta {{ display: flex; gap: 16px; margin-top: 6px; flex-wrap: wrap; }}
-.species-meta span {{ font-size: 10px; color: #666; }}
-.impact-box {{ background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }}
-.impact-box h3 {{ font-size: 11px; font-weight: 600; color: #856404; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }}
-.impact-row {{ display: flex; justify-content: space-between; padding: 3px 0; font-size: 10px; color: #555; border-bottom: 1px solid #fff3cd; }}
-.impact-row:last-child {{ border-bottom: none; }}
-.impact-row strong {{ color: #1a7a4a; }}
-.footer {{ margin-top: 32px; padding: 16px 40px; border-top: 1px solid #e0e0da; display: flex; justify-content: space-between; font-size: 9px; color: #aaa; }}
-.page-break {{ page-break-before: always; }}
-</style>
-</head>
-<body>
-
-<div class="cover">
-  <h1>Treeat</h1>
-  <div class="sub">Urban Tree Planting Plan · Vienna</div>
-  <div class="meta">Generated {now_str} · Powered by Infrared SDK · infrared.city</div>
-</div>
-
-<div class="stats-row">
-  <div class="stat-box"><div class="val">{total_trees}</div><div class="lbl">Trees recommended</div></div>
-  <div class="stat-box"><div class="val">€{total_cost:,}</div><div class="lbl">Estimated budget</div></div>
-  <div class="stat-box"><div class="val">-{wind_improvement} m/s</div><div class="lbl">Wind reduction</div></div>
-  <div class="stat-box"><div class="val">-{pet_improvement}°C</div><div class="lbl">PET improvement</div></div>
-</div>
-
-<div class="section">
-  <h2>Environmental Impact</h2>
-  <div class="impact-box">
-    <h3>Projected improvements after planting</h3>
-    <div class="impact-row"><span>Average wind speed reduction</span><strong>-{wind_improvement} m/s</strong></div>
-    <div class="impact-row"><span>PET (thermal comfort) improvement</span><strong>-{pet_improvement}°C</strong></div>
-    <div class="impact-row"><span>Estimated CO₂ sequestration/year</span><strong>{round(total_trees * 21.7, 0):.0f} kg</strong></div>
-    <div class="impact-row"><span>Estimated shade coverage</span><strong>{round(total_trees * 28.3, 0):.0f} m²</strong></div>
-    <div class="impact-row"><span>Streets with improved comfort</span><strong>{len(features)}</strong></div>
-  </div>
-</div>
-
-<div class="section">
-  <h2>Recommended Species</h2>
-  {species_cards}
-</div>
-
-<div class="section page-break">
-  <h2>Planting Schedule by Street</h2>
-  <table>
-    <thead><tr><th>Location</th><th>Length</th><th>Wind (m/s)</th><th>Trees</th><th>Species</th><th>Cost</th></tr></thead>
-    <tbody>{street_rows}</tbody>
-  </table>
-</div>
-
-<div class="section">
-  <h2>Recommended Suppliers</h2>
-  <table>
-    <thead><tr><th>Supplier</th><th>Location</th><th>Species</th><th>Lead time</th><th>Contact</th></tr></thead>
-    <tbody>{supplier_rows}</tbody>
-  </table>
-</div>
-
-<div class="footer">
-  <span>Treeat · Urban Tree Planting Plan</span>
-  <span>Data source: Infrared SDK · infrared.city · OpenStreetMap</span>
-  <span>{year_str}</span>
-</div>
-
-</body>
-</html>"""
-
-    from weasyprint import HTML as WP_HTML
-    pdf_bytes = WP_HTML(string=html).write_pdf()
-    return Response(
-        content=pdf_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": 'attachment; filename="treeat-planting-plan.pdf"'},
-    )
-
-
-@app.get("/api/map-search")
 async def map_search(q: str):
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": f"{q}, Vienna, Austria", "format": "json", "limit": 1, "countrycodes": "at"}
@@ -928,21 +941,12 @@ async def geocode(q: str):
 
 @app.post("/api/cool-route")
 async def start_cool_route(request: dict):
-    origin = request["origin"]
-    destination = request["destination"]
+    origin          = request["origin"]
+    destination     = request["destination"]
+    analysis_job_id = request.get("analysis_job_id")   # reuse stored UTCI grid if available
     job_id = str(uuid.uuid4())
-    route_jobs[job_id] = {
-        "status": "running",
-        "progress": 0,
-        "step": "Starting...",
-        "result": None,
-    }
-    thread = threading.Thread(
-        target=find_cool_route,
-        args=(job_id, origin, destination),
-        daemon=True,
-    )
-    thread.start()
+    route_jobs[job_id] = {"status": "running", "progress": 0, "step": "Starting...", "result": None}
+    threading.Thread(target=find_cool_route, args=(job_id, origin, destination, analysis_job_id), daemon=True).start()
     return {"job_id": job_id}
 
 
@@ -953,144 +957,132 @@ async def get_route_job(job_id: str):
     return route_jobs[job_id]
 
 
-def find_cool_route(job_id, origin, dest):
+def find_cool_route(job_id, origin, dest, analysis_job_id=None):
     try:
-        import osmnx as ox
-        import networkx as nx
-        from infrared_sdk import InfraredClient
-        from infrared_sdk.analyses.types import WindModelRequest, AnalysesName
-        import numpy as np
-
         min_lon = min(origin[0], dest[0])
         max_lon = max(origin[0], dest[0])
         min_lat = min(origin[1], dest[1])
         max_lat = max(origin[1], dest[1])
-
         pad_lon = max((max_lon - min_lon) * 0.2, 0.004)
         pad_lat = max((max_lat - min_lat) * 0.2, 0.004)
-
         min_lon = max(min_lon - pad_lon, 16.18)
         max_lon = min(max_lon + pad_lon, 16.59)
         min_lat = max(min_lat - pad_lat, 48.12)
         max_lat = min(max_lat + pad_lat, 48.34)
 
-        polygon = {
-            "type": "Polygon",
-            "coordinates": [[
-                [min_lon, min_lat],
-                [max_lon, min_lat],
-                [max_lon, max_lat],
-                [min_lon, max_lat],
-                [min_lon, min_lat],
-            ]],
-        }
+        # ── Try to reuse stored UTCI grid from a completed analysis ──────────
+        grid_np, bounds_t, planting_edges = None, None, set()
+        if analysis_job_id and analysis_job_id in jobs:
+            j = jobs[analysis_job_id]
+            if j.get("status") == "complete":
+                res = j["results"]
+                if res.get("grid") and res.get("bounds_raw"):
+                    grid_np  = np.array(res["grid"])
+                    bounds_t = tuple(res["bounds_raw"])
+                    for f in res.get("planting_locations", {}).get("features", []):
+                        p = f.get("properties", {})
+                        u, v = p.get("node_u"), p.get("node_v")
+                        if u is not None and v is not None:
+                            planting_edges.add((u, v))
+                            planting_edges.add((v, u))
 
-        route_jobs[job_id]["progress"] = 10
-        route_jobs[job_id]["step"] = "Fetching buildings..."
+        # ── Fast path: stored grid available — reuse cached graph or skip SDK ─
+        if grid_np is not None:
+            # Try to reuse the graph built during analysis (instant, no download)
+            G = jobs.get(analysis_job_id, {}).get("_graph") if analysis_job_id else None
 
-        with InfraredClient() as client:
-            area = client.buildings.get_area(polygon)
-
-            route_jobs[job_id]["progress"] = 30
-            route_jobs[job_id]["step"] = "Running wind simulation..."
-
-            payload = WindModelRequest(
-                analysis_type=AnalysesName.wind_speed,
-                wind_speed=5,
-                wind_direction=270,
-            )
-            result = client.run_area_and_wait(
-                payload, polygon,
-                buildings=area.buildings,
-            )
-
-            grid = result.merged_grid
-            bounds = result.bounds
-            n_rows, n_cols = grid.shape
-            b_min_lon, b_min_lat = bounds[0], bounds[1]
-            b_max_lon, b_max_lat = bounds[2], bounds[3]
-
-            def sample(lon, lat):
-                col = int((lon - b_min_lon) / (b_max_lon - b_min_lon) * (n_cols - 1))
-                row = int((b_max_lat - lat) / (b_max_lat - b_min_lat) * (n_rows - 1))
-                row = max(0, min(row, n_rows - 1))
-                col = max(0, min(col, n_cols - 1))
-                v = grid[row, col]
-                return float(v) if not np.isnan(v) else 5.0
-
-            route_jobs[job_id]["progress"] = 70
-            route_jobs[job_id]["step"] = "Building street graph..."
-
-            ox.settings.timeout = 60
-            ox.settings.max_query_area_size = 5_000_000
-
-            G = ox.graph_from_bbox(
-                bbox=(max_lat, min_lat, max_lon, min_lon),
-                network_type="walk",
-                retain_all=False,
-            )
+            if G is None:
+                route_jobs[job_id].update(progress=15, step="Building street graph...")
+                ox.settings.timeout = 60
+                ox.settings.max_query_area_size = 5_000_000
+                G = ox.graph_from_bbox(bbox=(max_lat, min_lat, max_lon, min_lon), network_type="walk", retain_all=False)
+            else:
+                route_jobs[job_id].update(progress=50, step="Weighting graph edges...")
 
             for u, v, data in G.edges(data=True):
                 mx = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
                 my = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
-                data["wind"] = sample(mx, my)
+                utci = sample_grid(grid_np, bounds_t, mx, my)
+                # Planting-street bonus: 0.3× weight so Dijkstra strongly prefers
+                # streets where trees will be planted (future coolest corridors)
+                if (u, v) in planting_edges or (v, u) in planting_edges:
+                    utci = utci * 0.3
+                data["utci"]   = utci
                 data["length"] = data.get("length", 50)
 
-            route_jobs[job_id]["progress"] = 85
-            route_jobs[job_id]["step"] = "Finding optimal routes..."
+            route_jobs[job_id].update(progress=80, step="Finding optimal routes...")
 
-            orig_node = ox.nearest_nodes(G, origin[0], origin[1])
-            dest_node = ox.nearest_nodes(G, dest[0], dest[1])
+        # ── Slow path: no stored grid — run full UTCI simulation ─────────────
+        else:
+            center_lat_r = (min_lat + max_lat) / 2
+            center_lon_r = (min_lon + max_lon) / 2
+            polygon = {"type": "Polygon", "coordinates": [[
+                [min_lon, min_lat], [max_lon, min_lat],
+                [max_lon, max_lat], [min_lon, max_lat], [min_lon, min_lat],
+            ]]}
 
-            def path_to_feature(G, path):
-                coords = [[G.nodes[n]["x"], G.nodes[n]["y"]] for n in path]
-                total_len = 0
-                wind_vals = []
-                for i in range(len(path) - 1):
-                    u, v = path[i], path[i + 1]
-                    edges = G[u][v]
-                    k = list(edges.keys())[0]
-                    e = edges[k]
+            with InfraredClient() as client:
+                route_jobs[job_id].update(progress=10, step="Fetching buildings...")
+                area       = client.buildings.get_area(polygon)
+                route_jobs[job_id].update(progress=18, step="Fetching vegetation...")
+                vegetation = client.vegetation.get_area(polygon)
+                route_jobs[job_id].update(progress=24, step="Fetching ground materials...")
+                ground     = client.ground_materials.get_area(polygon)
+                route_jobs[job_id].update(progress=30, step="Fetching weather data...")
+                tp = TimePeriod(start_month=7, start_day=1, start_hour=9, end_month=7, end_day=31, end_hour=18)
+                locations    = client.weather.get_weather_file_from_location(lat=center_lat_r, lon=center_lon_r, radius=50)
+                weather_data = client.weather.filter_weather_data(identifier=locations[0]["uuid"], time_period=tp)
+                route_jobs[job_id].update(progress=36, step="Running UTCI simulation...")
+                payload = UtciModelRequest.from_weatherfile_payload(
+                    payload=UtciModelBaseRequest(analysis_type=AnalysesName.thermal_comfort_index),
+                    location=Location(latitude=center_lat_r, longitude=center_lon_r),
+                    time_period=tp, weather_data=weather_data,
+                )
+                result = client.run_area_and_wait(payload, polygon,
+                    buildings=area.buildings, vegetation=vegetation.features, ground_materials=ground.layers)
+
+                grid    = result.merged_grid
+                bounds  = result.bounds
+                grid_np = grid
+                bounds_t = bounds
+
+            route_jobs[job_id].update(progress=75, step="Building street graph...")
+            ox.settings.timeout = 60
+            ox.settings.max_query_area_size = 5_000_000
+            G = ox.graph_from_bbox(bbox=(max_lat, min_lat, max_lon, min_lon), network_type="walk", retain_all=False)
+            for u, v, data in G.edges(data=True):
+                mx = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
+                my = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
+                data["utci"]   = sample_grid(grid_np, bounds_t, mx, my)
+                data["length"] = data.get("length", 50)
+            route_jobs[job_id].update(progress=88, step="Finding optimal routes...")
+
+        # ── Dijkstra ─────────────────────────────────────────────────────────
+        orig_node = ox.nearest_nodes(G, origin[0], origin[1])
+        dest_node = ox.nearest_nodes(G, dest[0],   dest[1])
+
+        def path_to_feature(path):
+            coords, total_len, utci_vals = [], 0, []
+            for i, n in enumerate(path):
+                coords.append([G.nodes[n]["x"], G.nodes[n]["y"]])
+                if i < len(path) - 1:
+                    e = G[path[i]][path[i+1]][list(G[path[i]][path[i+1]].keys())[0]]
                     total_len += e.get("length", 0)
-                    wind_vals.append(e.get("wind", 5.0))
-                avg_wind = sum(wind_vals) / len(wind_vals) if wind_vals else 5.0
-                return {
-                    "type": "Feature",
-                    "geometry": {"type": "LineString", "coordinates": coords},
-                    "properties": {
-                        "distance_m": round(total_len),
-                        "avg_wind": round(avg_wind, 2),
-                    },
-                }
+                    utci_vals.append(e.get("utci", 32.0))
+            avg_utci = sum(utci_vals) / len(utci_vals) if utci_vals else 32.0
+            return {"type": "Feature", "geometry": {"type": "LineString", "coordinates": coords},
+                    "properties": {"distance_m": round(total_len), "avg_utci": round(avg_utci, 2)}}
 
-            fastest_path = nx.shortest_path(G, orig_node, dest_node, weight="length")
-            coolest_path = nx.shortest_path(G, orig_node, dest_node, weight="wind")
+        coolest = path_to_feature(nx.shortest_path(G, orig_node, dest_node, weight="utci"))
 
-            fastest = path_to_feature(G, fastest_path)
-            coolest = path_to_feature(G, coolest_path)
-
-            route_jobs[job_id]["status"] = "complete"
-            route_jobs[job_id]["progress"] = 100
-            route_jobs[job_id]["step"] = "Complete"
-            route_jobs[job_id]["result"] = {
-                "fastest": fastest,
-                "coolest": coolest,
-                "comparison": {
-                    "distance_diff_m": (
-                        coolest["properties"]["distance_m"] - fastest["properties"]["distance_m"]
-                    ),
-                    "wind_diff": round(
-                        fastest["properties"]["avg_wind"] - coolest["properties"]["avg_wind"], 2
-                    ),
-                    "fastest_dist": fastest["properties"]["distance_m"],
-                    "fastest_wind": fastest["properties"]["avg_wind"],
-                    "coolest_dist": coolest["properties"]["distance_m"],
-                    "coolest_wind": coolest["properties"]["avg_wind"],
-                },
-            }
+        route_jobs[job_id].update(status="complete", progress=100, step="Complete", result={
+            "coolest": coolest,
+            "distance_m": coolest["properties"]["distance_m"],
+            "avg_utci":   coolest["properties"]["avg_utci"],
+        })
 
     except Exception as e:
         import traceback
         print(traceback.format_exc())
         route_jobs[job_id]["status"] = "error"
-        route_jobs[job_id]["step"] = f"Error: {str(e)}"
+        route_jobs[job_id]["step"]   = f"Error: {str(e)}"

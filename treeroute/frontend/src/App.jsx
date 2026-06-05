@@ -4,6 +4,10 @@ import 'maplibre-gl/dist/maplibre-gl.css'
 import MapboxDraw from '@mapbox/mapbox-gl-draw'
 import './App.css'
 
+// Backend base URL. Empty in dev (Vite proxies /api → localhost:8000);
+// in prod set VITE_API_URL on Vercel to your Railway backend URL.
+const API_BASE = import.meta.env.VITE_API_URL || ''
+
 const MAP_STYLE = {
   version: 8,
   glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
@@ -68,7 +72,7 @@ function MapSearch({ onNavigate }) {
     clearTimeout(debounce.current)
     debounce.current = setTimeout(async () => {
       try {
-        const r = await fetch(`/api/geocode?q=${encodeURIComponent(val)}`)
+        const r = await fetch(`${API_BASE}/api/geocode?q=${encodeURIComponent(val)}`)
         setResults(await r.json())
       } catch (e) {}
     }, 350)
@@ -115,7 +119,7 @@ function RouteAddressInput({ placeholder, dotColor, onSelect, onPickOnMap, isPic
     clearTimeout(debounce.current)
     debounce.current = setTimeout(async () => {
       try {
-        const r = await fetch(`/api/geocode?q=${encodeURIComponent(val)}`)
+        const r = await fetch(`${API_BASE}/api/geocode?q=${encodeURIComponent(val)}`)
         setResults(await r.json())
       } catch (e) {}
     }, 350)
@@ -190,6 +194,14 @@ export default function App() {
   const [analysisComplete, setAnalysisComplete] = useState(false)
   const [currentJobId,     setCurrentJobId]     = useState(null)
   const [openSection,      setOpenSection]      = useState(null)
+
+  // Budget optimizer
+  const [budgetEur,  setBudgetEur]  = useState(50000)
+  const [budgetMeta, setBudgetMeta] = useState(null)
+
+  // Before / after toggle
+  const [showAfter,      setShowAfter]      = useState(false)
+  const [utciAfterMean,  setUtciAfterMean]  = useState(null)
 
   // Street panel
   const [selectedStreet,  setSelectedStreet]  = useState(null)
@@ -276,15 +288,12 @@ export default function App() {
       map.addLayer({ id: 'planting-layer-bg', type: 'line', source: 'planting-source', paint: { 'line-color': '#2ca02c', 'line-width': 10, 'line-opacity': 0.25 } })
       map.addLayer({ id: 'planting-layer',    type: 'line', source: 'planting-source', paint: { 'line-color': '#2ca02c', 'line-width': 5,  'line-opacity': 1.0  } })
 
-      // Route layers
-      map.addSource('route-source', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
-      map.addLayer({ id: 'route-layer', type: 'line', source: 'route-source', paint: { 'line-color': '#2196F3', 'line-width': 5, 'line-opacity': 1.0, 'line-dasharray': [2, 1] } })
-
-      map.addSource('route-fastest-source', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
-      map.addLayer({ id: 'route-fastest-layer', type: 'line', source: 'route-fastest-source', paint: { 'line-color': '#e05c5c', 'line-width': 4, 'line-opacity': 1.0 } })
-
+      // Cool route — single thick green line
       map.addSource('route-coolest-source', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } })
-      map.addLayer({ id: 'route-coolest-layer', type: 'line', source: 'route-coolest-source', paint: { 'line-color': '#2196F3', 'line-width': 5, 'line-opacity': 1.0, 'line-dasharray': [2, 1] } })
+      map.addLayer({
+        id: 'route-coolest-layer', type: 'line', source: 'route-coolest-source',
+        paint: { 'line-color': '#1a7a4a', 'line-width': 6, 'line-opacity': 1.0 },
+      })
 
       // Planting hover popup
       plantingPopup.current = new maplibregl.Popup({ closeButton: false, closeOnClick: false, className: 'planting-popup', offset: 6 })
@@ -298,7 +307,7 @@ export default function App() {
           .setLngLat(e.lngLat)
           .setHTML(`<div class="pp-inner">
             <strong>Priority planting street</strong><br/>
-            Wind: ${parseFloat(p.avg_wind ?? 0).toFixed(1)} m/s &nbsp;·&nbsp; ${p.recommended_trees ?? 1} trees recommended<br/>
+            UTCI: ${parseFloat(p.avg_utci ?? 32).toFixed(1)}°C &nbsp;·&nbsp; ${p.recommended_trees ?? 1} trees recommended<br/>
             <span class="pp-hint">Click to explore</span>
           </div>`)
           .addTo(map)
@@ -384,7 +393,7 @@ export default function App() {
       setStreetSpecies([])
       setSuppliers([])
       setShowStreetPanel(true)
-      fetch(`/api/street-species?wind=${d.props.avg_wind ?? 3.0}`)
+      fetch(`${API_BASE}/api/street-species?utci=${d.props.avg_utci ?? 32.0}`)
         .then(r => r.json()).then(setStreetSpecies).catch(() => {})
     }
     window.__closeStreetPanel = () => { setShowStreetPanel(false); setSelectedStreet(null) }
@@ -400,7 +409,7 @@ export default function App() {
   // Load suppliers when species selected
   useEffect(() => {
     if (!selectedSpecies) return
-    fetch('/api/suppliers').then(r => r.json()).then(data => {
+    fetch(`${API_BASE}/api/suppliers`).then(r => r.json()).then(data => {
       const n = selectedSpecies.name.split(' ')[0].toLowerCase()
       setSuppliers(data.filter(s => s.species.some(sp => sp.toLowerCase().includes(n) || n.includes(sp.toLowerCase()))))
     }).catch(() => {})
@@ -414,10 +423,10 @@ export default function App() {
     mapRef.current?.getSource('route-fastest-source')?.setData({ type: 'FeatureCollection', features: [] })
     mapRef.current?.getSource('route-coolest-source')?.setData({ type: 'FeatureCollection', features: [] })
     try {
-      const res = await fetch('/api/cool-route', {
+      const res = await fetch(`${API_BASE}/api/cool-route`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ origin, destination: dest }),
+        body: JSON.stringify({ origin, destination: dest, analysis_job_id: currentJobId }),
       })
       const { job_id } = await res.json()
       pollRouteJob(job_id)
@@ -429,21 +438,20 @@ export default function App() {
 
   function pollRouteJob(id) {
     const interval = setInterval(async () => {
-      const data = await fetch(`/api/cool-route-job/${id}`).then(r => r.json())
+      const data = await fetch(`${API_BASE}/api/cool-route-job/${id}`).then(r => r.json())
       setRouteProgress(data.progress || 0)
       setRouteStep(data.step || '')
 
       if (data.status === 'complete') {
         clearInterval(interval)
-        const { fastest, coolest, comparison } = data.result
+        const { coolest } = data.result
         const map = mapRef.current
-        map.getSource('route-fastest-source')?.setData({ type: 'FeatureCollection', features: [fastest] })
         map.getSource('route-coolest-source')?.setData({ type: 'FeatureCollection', features: [coolest] })
-        const allCoords = [...fastest.geometry.coordinates, ...coolest.geometry.coordinates]
-        const lngs = allCoords.map(c => c[0])
-        const lats = allCoords.map(c => c[1])
-        map.fitBounds([[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]], { padding: 80, duration: 1000 })
-        setRouteResult(comparison)
+        const coords = coolest.geometry.coordinates
+        const lngs = coords.map(c => c[0])
+        const lats = coords.map(c => c[1])
+        map.fitBounds([[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]], { padding: 100, duration: 1000 })
+        setRouteResult({ distance_m: data.result.distance_m, avg_utci: data.result.avg_utci })
         setRouteMode('showing')
       } else if (data.status === 'error') {
         clearInterval(interval)
@@ -458,11 +466,7 @@ export default function App() {
     destMarkerRef.current?.remove();   destMarkerRef.current   = null
     routeOriginRef.current = null;     routeDestRef.current    = null
     setRouteMode(null); setRouteResult(null); setRouteOrigin(null); setRouteDest(null)
-    const map = mapRef.current
-    if (map) {
-      map.getSource('route-fastest-source')?.setData({ type: 'FeatureCollection', features: [] })
-      map.getSource('route-coolest-source')?.setData({ type: 'FeatureCollection', features: [] })
-    }
+    mapRef.current?.getSource('route-coolest-source')?.setData({ type: 'FeatureCollection', features: [] })
   }
 
   // ── View toggle ────────────────────────────────────────────────────────────
@@ -483,9 +487,9 @@ export default function App() {
   function toggleLayer(key) {
     const map = mapRef.current; if (!map) return
     const ids = {
-      wind:     ['wind-layer'],
+      wind:     ['wind-layer', 'wind-after-layer'],
       planting: ['planting-layer', 'planting-layer-bg'],
-      route:    ['route-layer', 'route-fastest-layer', 'route-coolest-layer'],
+      route:    ['route-coolest-layer'],
     }[key] ?? []
     const existingId = ids.find(id => map.getLayer(id))
     const vis  = existingId ? (map.getLayoutProperty(existingId, 'visibility') ?? 'visible') : 'visible'
@@ -513,24 +517,25 @@ export default function App() {
     setDrawnPolygon(null); drawRef.current?.deleteAll()
     setJobStatus('running'); setProgress(0); setProgressStep('Starting...')
     try {
-      const { job_id } = await fetch('/api/analyze', {
+      const { job_id } = await fetch(`${API_BASE}/api/analyze`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ polygon }),
       }).then(r => r.json())
 
       const interval = setInterval(async () => {
-        const job = await fetch(`/api/job/${job_id}`).then(r => r.json())
+        const job = await fetch(`${API_BASE}/api/job/${job_id}`).then(r => r.json())
         setProgress(job.progress ?? 0)
         setProgressStep(job.step ?? '')
         if (job.status === 'complete') {
           clearInterval(interval)
           setCurrentJobId(job_id)
-          const results = await fetch(`/api/job/${job_id}/results`).then(r => r.json())
+          const results = await fetch(`${API_BASE}/api/job/${job_id}/results`).then(r => r.json())
           applyResults(results)
           setJobStatus(null)
           setAnalysisComplete(true)
           setOpenSection('trees')
           showToast('Analysis complete!')
+          applyBudget(budgetEur, job_id)
         } else if (job.status === 'error') {
           clearInterval(interval); setJobStatus(null)
           showToast(`Error: ${job.step}`)
@@ -542,18 +547,34 @@ export default function App() {
   function applyResults(results) {
     const map = mapRef.current
     if (!map) return
-    const { bounds, wind_image, planting_locations, cool_route, stats: s } = results
+    const { bounds, utci_after_bounds, utci_image, utci_after_image, planting_locations, cool_route, stats: s } = results
     if (!bounds) return
     const { west: w, south: s2, east: e, north: n } = bounds
+    const coords = [[w, n], [e, n], [e, s2], [w, s2]]
+    const beforeInsert = map.getLayer('planting-layer-bg') ? 'planting-layer-bg' : undefined
 
+    // Before layer (visible by default)
     try {
-      const imgUrl = `data:image/png;base64,${wind_image}`
-      const coords = [[w, n], [e, n], [e, s2], [w, s2]]
+      const imgUrl = `data:image/png;base64,${utci_image}`
       if (map.getSource('wind-source')) { map.removeLayer('wind-layer'); map.removeSource('wind-source') }
       map.addSource('wind-source', { type: 'image', url: imgUrl, coordinates: coords })
-      const beforeLayer = map.getLayer('planting-layer-bg') ? 'planting-layer-bg' : undefined
-      map.addLayer({ id: 'wind-layer', type: 'raster', source: 'wind-source', paint: { 'raster-opacity': 0.65 } }, beforeLayer)
+      map.addLayer({ id: 'wind-layer', type: 'raster', source: 'wind-source', paint: { 'raster-opacity': 0.65 } }, beforeInsert)
     } catch (err) { console.warn('wind layer error:', err) }
+
+    // After layer — uses its own bounds (SDK may return different tile coverage)
+    if (utci_after_image) {
+      try {
+        const ab = utci_after_bounds || bounds
+        const afterCoords = [[ab.west, ab.north], [ab.east, ab.north], [ab.east, ab.south], [ab.west, ab.south]]
+        const imgAfterUrl = `data:image/png;base64,${utci_after_image}`
+        if (map.getSource('wind-after-source')) { map.removeLayer('wind-after-layer'); map.removeSource('wind-after-source') }
+        map.addSource('wind-after-source', { type: 'image', url: imgAfterUrl, coordinates: afterCoords })
+        map.addLayer({ id: 'wind-after-layer', type: 'raster', source: 'wind-after-source', paint: { 'raster-opacity': 0.65 }, layout: { visibility: 'none' } }, beforeInsert)
+      } catch (err) { console.warn('wind-after layer error:', err) }
+    }
+
+    setShowAfter(false)
+    if (s?.utci_after_mean != null) setUtciAfterMean(s.utci_after_mean)
 
     const plantSrc = map.getSource('planting-source')
     if (plantSrc && planting_locations) plantSrc.setData(planting_locations)
@@ -567,6 +588,34 @@ export default function App() {
 
     map.fitBounds([[w, s2], [e, n]], { padding: 60, duration: 1000 })
     if (s) setStats(s)
+  }
+
+  // ── Budget optimizer ───────────────────────────────────────────────────────
+  const budgetDebounce = useRef(null)
+
+  async function applyBudget(budget, jobId) {
+    const id = jobId ?? currentJobId
+    if (!id) return
+    try {
+      const data = await fetch(`${API_BASE}/api/budget?job_id=${id}&budget_eur=${budget}`).then(r => r.json())
+      mapRef.current?.getSource('planting-source')?.setData(data.geojson)
+      setBudgetMeta(data.meta)
+    } catch (_) {}
+  }
+
+  function onBudgetChange(val) {
+    setBudgetEur(val)
+    clearTimeout(budgetDebounce.current)
+    budgetDebounce.current = setTimeout(() => applyBudget(val), 300)
+  }
+
+  // ── Before / after toggle ──────────────────────────────────────────────────
+  function toggleBeforeAfter(after) {
+    setShowAfter(after)
+    const map = mapRef.current
+    if (!map) return
+    if (map.getLayer('wind-layer'))       map.setLayoutProperty('wind-layer',       'visibility', after ? 'none'    : 'visible')
+    if (map.getLayer('wind-after-layer')) map.setLayoutProperty('wind-after-layer', 'visibility', after ? 'visible' : 'none')
   }
 
   // ── Derived ────────────────────────────────────────────────────────────────
@@ -634,7 +683,7 @@ export default function App() {
                     <div className="progress-track">
                       <div className="progress-fill" style={{ width: `${progress}%` }} />
                     </div>
-                    <div className="progress-note">~20s · Infrared SDK</div>
+                    <div className="progress-note">~2 min · Infrared SDK UTCI</div>
                   </div>
                 )}
 
@@ -656,14 +705,61 @@ export default function App() {
                     <div className="stats-grid">
                       <div className="stat-card">
                         <div className="stat-value">
-                          {stats?.wind_mean ? `${parseFloat(stats.wind_mean).toFixed(1)}` : '--'} m/s
+                          {stats?.utci_mean ? `${parseFloat(stats.utci_mean).toFixed(1)}` : '--'}°C
                         </div>
-                        <div className="stat-label">avg wind speed</div>
+                        <div className="stat-label">avg UTCI (July peak)</div>
                       </div>
                       <div className="stat-card">
                         <div className="stat-value">{stats?.n_planting_streets ?? '--'}</div>
                         <div className="stat-label">streets analysed</div>
                       </div>
+                    </div>
+
+                    {/* Before / After toggle */}
+                    <div style={{ marginTop: 12 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: '#444', marginBottom: 6 }}>
+                        Heatmap view
+                      </div>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          onClick={() => toggleBeforeAfter(false)}
+                          style={{
+                            flex: 1, padding: '6px 0', fontSize: 11, fontWeight: 600,
+                            borderRadius: 6, cursor: 'pointer', border: '1.5px solid',
+                            borderColor: !showAfter ? '#1a7a4a' : '#ddd',
+                            background: !showAfter ? '#1a7a4a' : '#fff',
+                            color: !showAfter ? '#fff' : '#888',
+                          }}
+                        >
+                          Before
+                        </button>
+                        <button
+                          onClick={() => toggleBeforeAfter(true)}
+                          style={{
+                            flex: 1, padding: '6px 0', fontSize: 11, fontWeight: 600,
+                            borderRadius: 6, cursor: 'pointer', border: '1.5px solid',
+                            borderColor: showAfter ? '#1a7a4a' : '#ddd',
+                            background: showAfter ? '#1a7a4a' : '#fff',
+                            color: showAfter ? '#fff' : '#888',
+                          }}
+                        >
+                          After trees
+                        </button>
+                      </div>
+                      {showAfter && (
+                        <div style={{
+                          marginTop: 8, padding: '6px 10px',
+                          background: '#f0f9f4', borderRadius: 6,
+                          fontSize: 11, color: '#555', lineHeight: 1.4,
+                        }}>
+                          <span style={{ color: '#1a7a4a', fontWeight: 600 }}>
+                            −3°C UTCI under each canopy
+                          </span>
+                          <span style={{ color: '#999', marginLeft: 4 }}>
+                            · shading model · zoom in to see individual trees
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </>
                 )}
@@ -714,6 +810,39 @@ export default function App() {
                       </div>
                     </div>
 
+                    {/* Budget slider */}
+                    <div style={{ margin: '12px 0' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                        <span style={{ fontSize: 11, fontWeight: 600, color: '#444' }}>Tree budget</span>
+                        <span style={{ fontSize: 13, fontWeight: 700, color: '#1a7a4a' }}>
+                          €{budgetEur.toLocaleString()}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={5000}
+                        max={100000}
+                        step={2500}
+                        value={budgetEur}
+                        onChange={e => onBudgetChange(parseInt(e.target.value))}
+                        style={{ width: '100%', accentColor: '#1a7a4a' }}
+                      />
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#bbb', marginTop: 2 }}>
+                        <span>€5k</span><span>€100k</span>
+                      </div>
+                      {budgetMeta && (
+                        <div style={{
+                          marginTop: 8, padding: '6px 10px',
+                          background: '#f0f9f4', borderRadius: 6,
+                          fontSize: 11, color: '#444',
+                          display: 'flex', justifyContent: 'space-between',
+                        }}>
+                          <span>🌳 {budgetMeta.total_trees} trees · {budgetMeta.streets_funded} streets</span>
+                          <span style={{ color: '#1a7a4a', fontWeight: 600 }}>€{budgetMeta.total_cost?.toLocaleString()} used</span>
+                        </div>
+                      )}
+                    </div>
+
                     <p style={{ fontSize: 11, color: '#888', marginBottom: 8, lineHeight: 1.5 }}>
                       Click any green street on the map to explore species and costs.
                     </p>
@@ -724,7 +853,7 @@ export default function App() {
                         if (!currentJobId) return
                         showToast('Generating planting plan...')
                         try {
-                          const res = await fetch(`/api/planting-plan-pdf/${currentJobId}`)
+                          const res = await fetch(`${API_BASE}/api/planting-plan-pdf/${currentJobId}`)
                           const blob = await res.blob()
                           const url = URL.createObjectURL(blob)
                           const a = document.createElement('a')
@@ -812,22 +941,18 @@ export default function App() {
                     <div className="progress-track">
                       <div className="progress-fill" style={{ width: `${routeProgress}%` }} />
                     </div>
-                    <div className="progress-note">~20s · Infrared SDK</div>
+                    <div className="progress-note">~2 min · Infrared SDK UTCI</div>
                   </div>
                 )}
 
                 {routeMode === 'showing' && routeResult && (
                   <div className="route-result">
                     <div className="route-row">
-                      <div className="route-line-preview" style={{ background: '#e05c5c' }} />
-                      <span>Fastest: {routeResult.fastest_dist}m · {routeResult.fastest_wind} m/s wind</span>
+                      <div className="route-line-preview" style={{ background: '#1a7a4a' }} />
+                      <span style={{ fontWeight: 600 }}>Coolest path: {routeResult.distance_m}m</span>
                     </div>
-                    <div className="route-row">
-                      <div className="route-line-preview" style={{ background: '#2196F3' }} />
-                      <span>Coolest: {routeResult.coolest_dist}m · {routeResult.coolest_wind} m/s wind</span>
-                    </div>
-                    <div className="route-saving">
-                      +{routeResult.distance_diff_m}m longer · {routeResult.wind_diff} m/s less wind exposure
+                    <div style={{ fontSize: 11, color: '#888', marginTop: 4 }}>
+                      Avg UTCI {routeResult.avg_utci}°C · routes via planned tree streets
                     </div>
                     <button
                       onClick={clearRoute}
@@ -907,7 +1032,7 @@ export default function App() {
             <div className="progress-track" style={{ margin: '6px 0' }}>
               <div className="progress-fill" style={{ width: `${progress}%` }} />
             </div>
-            <div className="progress-note">~20 seconds · Infrared SDK · infrared.city</div>
+            <div className="progress-note">~2 min · Infrared SDK UTCI · infrared.city</div>
           </div>
         )}
 
@@ -924,7 +1049,7 @@ export default function App() {
                 <div className="sp-title">Planting Analysis</div>
                 <div className="sp-meta-row">
                   <span>📏 {selectedStreet.length_m}m street</span>
-                  <span>💨 {parseFloat(selectedStreet.avg_wind ?? 0).toFixed(1)} m/s avg wind</span>
+                  <span>🌡️ {parseFloat(selectedStreet.avg_utci ?? 32).toFixed(1)}°C UTCI</span>
                   <span>🌳 {selectedStreet.recommended_trees ?? 1} trees recommended</span>
                 </div>
               </div>

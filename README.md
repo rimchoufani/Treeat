@@ -358,6 +358,31 @@ The SDK reads `INFRARED_API_KEY` from the environment automatically.
 
 ---
 
+## Deploy (laptop → live URL)
+
+Track: **backend on Railway · frontend on Vercel** (no database — jobs are in-memory, data is static files).
+
+**Backend — Railway**
+1. [railway.com](https://railway.com) → New Project → Deploy from GitHub repo.
+2. Service → Settings → **Root Directory = `treeroute/backend`**. Railway reads `railway.toml` for the start command (`uvicorn main:app`) and the `/health` check.
+3. Variables: `INFRARED_API_KEY` (your key) and `ALLOWED_ORIGINS` (fill in after the frontend deploys).
+4. Settings → Networking → Generate Domain → open the URL + `/health` → `{"status":"ok"}`.
+
+**Frontend — Vercel**
+1. [vercel.com](https://vercel.com) → Add New Project → import the repo.
+2. **Root Directory = `treeroute/frontend`** (auto-detects Vite).
+3. Environment Variable `VITE_API_URL` = your Railway backend URL (Production + Preview).
+4. Deploy → you get `your-app.vercel.app`.
+
+**Close the loop (required)**
+Put the Vercel URL into Railway's `ALLOWED_ORIGINS`, then **redeploy the backend** — CORS is frozen at deploy time, so the browser blocks every call until you do.
+
+**The secret rule:** `INFRARED_API_KEY` lives only on the backend (Railway) and in local `.env` (gitignored). `VITE_API_URL` is public — it ships in the browser bundle, so it's a URL, never a secret.
+
+> Note: on free tiers the backend sleeps when idle and analysis jobs live in memory — a long-idle instance loses in-progress jobs. Fine for a live demo; warm it up before presenting.
+
+---
+
 ## Challenge track
 
 **The Tree Budget** — UTCI · thermal comfort statistics

@@ -1,11 +1,29 @@
-.venv/
+# ── Secrets — NEVER commit ────────────────────────────────
 .env
+*.env
+!.env.example
+
+# ── Python ────────────────────────────────────────────────
+.venv/
+.venv313/
+venv/
+.Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
 *.egg-info/
+
+# ── Node / frontend ───────────────────────────────────────
+node_modules/
 dist/
 build/
+.vite/
+
+# ── Logs ──────────────────────────────────────────────────
+*.log
+*.log.err
+
+# ── OS / editor ───────────────────────────────────────────
 .DS_Store
+Thumbs.db
