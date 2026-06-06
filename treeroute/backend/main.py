@@ -28,6 +28,10 @@ from infrared_sdk.analyses.types import (
 )
 from infrared_sdk.models import TimePeriod, Location
 
+from datetime import datetime
+
+from db import save_analysis, list_analyses, get_analysis, delete_analysis
+
 load_dotenv()
 
 app = FastAPI(title="TreeRoute API")
@@ -188,6 +192,35 @@ def secret_check():
         "key_len": len(k),
         "note": "Key stays on the backend. The browser never gets it.",
     }
+
+
+# ── Saved analyses (persistence) ─────────────────────────────────────────────
+@app.get("/api/saved")
+def api_saved_list():
+    """List remembered analyses (newest first). Survives refresh/redeploy."""
+    return list_analyses()
+
+
+@app.get("/api/saved/{aid}")
+def api_saved_get(aid: str):
+    rec = get_analysis(aid)
+    if not rec:
+        raise HTTPException(404, "Saved analysis not found")
+    # Rehydrate the in-memory job so budget/PDF endpoints work after a reload
+    # (e.g. following a redeploy that cleared RAM).
+    if aid not in jobs:
+        jobs[aid] = {
+            "status": "complete", "progress": 100, "step": "Complete",
+            "polygon": rec["polygon"], "results": rec["results"],
+        }
+    return rec
+
+
+@app.delete("/api/saved/{aid}")
+def api_saved_delete(aid: str):
+    if not delete_analysis(aid):
+        raise HTTPException(404, "Saved analysis not found")
+    return {"deleted": aid}
 
 
 @app.get("/api/tree-species")
@@ -635,35 +668,45 @@ def analyze_area(job_id: str, polygon: dict):
             utci_after_mean = round(float(np.nanmean(after_grid)), 2)
             a_min_lon, a_min_lat, a_max_lon, a_max_lat = min_lon_b, min_lat_b, max_lon_b, max_lat_b
 
-            jobs[job_id].update(
-                step="Complete",
-                progress=100,
-                status="complete",
-                results={
-                    "utci_image": img_b64,
-                    "utci_after_image": img_after_b64,
-                    "bounds": {
-                        "west": min_lon_b, "south": min_lat_b,
-                        "east": max_lon_b, "north": max_lat_b,
-                    },
-                    "utci_after_bounds": {
-                        "west": min_lon_b, "south": min_lat_b,
-                        "east": max_lon_b, "north": max_lat_b,
-                    },
-                    "bounds_raw": [min_lon_b, min_lat_b, max_lon_b, max_lat_b],
-                    "grid": grid.tolist(),
-                    "planting_locations": planting_geojson,
-                    "cool_route": route_geojson,
-                    "stats": {
-                        "utci_min": round(vmin, 2),
-                        "utci_max": round(vmax, 2),
-                        "utci_mean": round(float(np.nanmean(grid)), 2),
-                        "utci_after_mean": utci_after_mean,
-                        "n_planting_streets": len(plant_features),
-                        "total_trees": total_trees,
-                    },
+            _results = {
+                "utci_image": img_b64,
+                "utci_after_image": img_after_b64,
+                "bounds": {
+                    "west": min_lon_b, "south": min_lat_b,
+                    "east": max_lon_b, "north": max_lat_b,
                 },
+                "utci_after_bounds": {
+                    "west": min_lon_b, "south": min_lat_b,
+                    "east": max_lon_b, "north": max_lat_b,
+                },
+                "bounds_raw": [min_lon_b, min_lat_b, max_lon_b, max_lat_b],
+                "grid": grid.tolist(),
+                "planting_locations": planting_geojson,
+                "cool_route": route_geojson,
+                "stats": {
+                    "utci_min": round(vmin, 2),
+                    "utci_max": round(vmax, 2),
+                    "utci_mean": round(float(np.nanmean(grid)), 2),
+                    "utci_after_mean": utci_after_mean,
+                    "n_planting_streets": len(plant_features),
+                    "total_trees": total_trees,
+                },
+            }
+            jobs[job_id].update(
+                step="Complete", progress=100, status="complete", results=_results,
             )
+
+            # ── Persist so it survives refresh/redeploy ──────────────────────
+            try:
+                c_lon = (min_lon_b + max_lon_b) / 2
+                c_lat = (min_lat_b + max_lat_b) / 2
+                label = (
+                    f"{c_lat:.4f}, {c_lon:.4f} · {total_trees} trees · "
+                    f"{datetime.utcnow().strftime('%b %d %H:%M')} UTC"
+                )
+                save_analysis(job_id, polygon, _results, label)
+            except Exception as _e:
+                print(f"[persist] failed to save analysis {job_id}: {_e}")
 
     except Exception as e:
         jobs[job_id]["status"] = "error"

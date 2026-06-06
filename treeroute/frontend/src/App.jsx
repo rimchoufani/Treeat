@@ -194,6 +194,7 @@ export default function App() {
   const [analysisComplete, setAnalysisComplete] = useState(false)
   const [currentJobId,     setCurrentJobId]     = useState(null)
   const [openSection,      setOpenSection]      = useState(null)
+  const [savedList,        setSavedList]        = useState([])
 
   // Budget optimizer
   const [budgetEur,  setBudgetEur]  = useState(50000)
@@ -536,12 +537,46 @@ export default function App() {
           setOpenSection('trees')
           showToast('Analysis complete!')
           applyBudget(budgetEur, job_id)
+          refreshSaved()   // remember it — survives refresh
         } else if (job.status === 'error') {
           clearInterval(interval); setJobStatus(null)
           showToast(`Error: ${job.step}`)
         }
       }, 2000)
     } catch (_) { setJobStatus(null); showToast('Analysis failed — check backend') }
+  }
+
+  // ── Saved analyses (persistence) ──────────────────────────────────────────
+  async function refreshSaved() {
+    try {
+      const list = await fetch(`${API_BASE}/api/saved`).then(r => r.json())
+      setSavedList(Array.isArray(list) ? list : [])
+    } catch (_) { /* backend offline — leave list as-is */ }
+  }
+
+  // Load the remembered list once when the app opens (survives refresh).
+  useEffect(() => { refreshSaved() }, [])
+
+  async function loadSaved(id) {
+    try {
+      const rec = await fetch(`${API_BASE}/api/saved/${id}`).then(r => r.json())
+      if (!rec || !rec.results) { showToast('Could not load saved analysis'); return }
+      setCurrentJobId(id)
+      applyResults(rec.results)
+      setStats(rec.results.stats ?? null)
+      setUtciAfterMean(rec.results.stats?.utci_after_mean ?? null)
+      setAnalysisComplete(true)
+      setOpenSection('trees')
+      showToast('Loaded saved analysis')
+    } catch (_) { showToast('Could not load saved analysis') }
+  }
+
+  async function deleteSaved(id, e) {
+    e?.stopPropagation()
+    try {
+      await fetch(`${API_BASE}/api/saved/${id}`, { method: 'DELETE' })
+      setSavedList(list => list.filter(x => x.id !== id))
+    } catch (_) { showToast('Delete failed') }
   }
 
   function applyResults(results) {
@@ -964,6 +999,67 @@ export default function App() {
                     >
                       Clear route
                     </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* ── SAVED ANALYSES (persistence) ── */}
+          <div className="accordion-item">
+            <div className="accordion-header" onClick={() => toggleSection('saved')}>
+              <div className="accordion-icon" style={{ background: '#f0f7ff' }}>💾</div>
+              <div className="accordion-title">
+                <h3>Saved Analyses</h3>
+                <p>Past runs — survive refresh</p>
+              </div>
+              <span className={`accordion-badge ${savedList.length ? 'badge-active' : 'badge-idle'}`}>
+                {savedList.length ? `${savedList.length} saved` : 'None yet'}
+              </span>
+              <span className={`accordion-chevron ${openSection === 'saved' ? 'open' : ''}`}>▼</span>
+            </div>
+            <div className={`accordion-body ${openSection === 'saved' ? 'open' : ''}`}>
+              <div className="accordion-content">
+                <p style={{ fontSize: 11, color: '#999', marginBottom: 12, lineHeight: 1.5 }}>
+                  Every completed analysis is remembered in the database. Reload one anytime — even after a refresh or redeploy.
+                </p>
+
+                {savedList.length === 0 ? (
+                  <div style={{ fontSize: 11, color: '#bbb', textAlign: 'center', padding: '12px 0' }}>
+                    No saved analyses yet. Run one to remember it.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {savedList.map(item => (
+                      <div
+                        key={item.id}
+                        onClick={() => loadSaved(item.id)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px',
+                          border: '1px solid #eee', borderRadius: 8, cursor: 'pointer',
+                          background: currentJobId === item.id ? '#f0f7ff' : '#fff',
+                        }}
+                      >
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 12, fontWeight: 600, color: '#333' }}>
+                            {item.total_trees} trees · {item.n_planting_streets} streets
+                          </div>
+                          <div style={{ fontSize: 10, color: '#999', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {item.label || item.created_at}
+                          </div>
+                        </div>
+                        <button
+                          title="Delete"
+                          onClick={(e) => deleteSaved(item.id, e)}
+                          style={{
+                            border: 'none', background: 'transparent', color: '#c44',
+                            cursor: 'pointer', fontSize: 14, padding: 4, lineHeight: 1,
+                          }}
+                        >
+                          🗑
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
