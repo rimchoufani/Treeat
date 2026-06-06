@@ -999,7 +999,11 @@ def find_cool_route(job_id, origin, dest, analysis_job_id=None):
                 route_jobs[job_id].update(progress=15, step="Building street graph...")
                 ox.settings.timeout = 60
                 ox.settings.max_query_area_size = 5_000_000
-                G = ox.graph_from_bbox(bbox=(max_lat, min_lat, max_lon, min_lon), network_type="walk", retain_all=False)
+                _bbox_poly = {"type": "Polygon", "coordinates": [[
+                    [min_lon, min_lat], [max_lon, min_lat],
+                    [max_lon, max_lat], [min_lon, max_lat], [min_lon, min_lat],
+                ]]}
+                G = ox.graph_from_polygon(shape(_bbox_poly), network_type="walk", retain_all=False)
             else:
                 route_jobs[job_id].update(progress=50, step="Weighting graph edges...")
 
@@ -1053,7 +1057,7 @@ def find_cool_route(job_id, origin, dest, analysis_job_id=None):
             route_jobs[job_id].update(progress=75, step="Building street graph...")
             ox.settings.timeout = 60
             ox.settings.max_query_area_size = 5_000_000
-            G = ox.graph_from_bbox(bbox=(max_lat, min_lat, max_lon, min_lon), network_type="walk", retain_all=False)
+            G = ox.graph_from_polygon(shape(polygon), network_type="walk", retain_all=False)
             for u, v, data in G.edges(data=True):
                 mx = (G.nodes[u]["x"] + G.nodes[v]["x"]) / 2
                 my = (G.nodes[u]["y"] + G.nodes[v]["y"]) / 2
