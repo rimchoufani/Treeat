@@ -30,7 +30,7 @@ from infrared_sdk.models import TimePeriod, Location
 
 from datetime import datetime
 
-from db import save_analysis, list_analyses, get_analysis, delete_analysis
+from db import save_analysis, list_analyses, get_analysis, delete_analysis, diagnostics as db_diagnostics
 
 load_dotenv()
 
@@ -195,6 +195,12 @@ def secret_check():
 
 
 # ── Saved analyses (persistence) ─────────────────────────────────────────────
+@app.get("/api/debug/persist")
+def api_debug_persist():
+    """Self-test the DB write path and surface the real error (debug only)."""
+    return db_diagnostics()
+
+
 @app.get("/api/saved")
 def api_saved_list():
     """List remembered analyses (newest first). Survives refresh/redeploy."""

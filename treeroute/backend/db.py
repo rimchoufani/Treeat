@@ -132,3 +132,29 @@ def delete_analysis(aid: str) -> bool:
         s.delete(r)
         s.commit()
         return True
+
+
+def diagnostics() -> dict:
+    """Self-test the DB write path and report config — for debugging only."""
+    import traceback
+    backend = "postgres" if DATABASE_URL.startswith("postgresql") else (
+        "sqlite" if DATABASE_URL.startswith("sqlite") else "other")
+    info = {"backend": backend, "url_scheme": DATABASE_URL.split("://", 1)[0],
+            "database_url_set": bool(os.getenv("DATABASE_URL", "").strip())}
+    if backend == "sqlite":
+        info["sqlite_path"] = DATABASE_URL.replace("sqlite:///", "")
+        info["dir_writable"] = os.access(os.path.dirname(info["sqlite_path"]) or ".", os.W_OK)
+    try:
+        poly = {"type": "Polygon", "coordinates": [[[0, 0], [0, 1], [1, 1], [0, 0]]]}
+        res = {"grid": [[1.0, float("nan")]], "stats": {"utci_mean": float("nan"),
+               "utci_after_mean": 1.0, "total_trees": 1, "n_planting_streets": 1}}
+        save_analysis("__selftest__", poly, res, "selftest")
+        ok = any(r["id"] == "__selftest__" for r in list_analyses())
+        delete_analysis("__selftest__")
+        info["write_ok"] = ok
+        info["error"] = None
+    except Exception as e:
+        info["write_ok"] = False
+        info["error"] = f"{type(e).__name__}: {e}"
+        info["traceback"] = traceback.format_exc()[-1500:]
+    return info
