@@ -180,8 +180,12 @@ def health():
 @app.get("/secret-check")
 def secret_check():
     # Proof the key lives on the backend — without revealing it.
+    k = os.getenv("INFRARED_API_KEY", "")
+    fp = (k[:4] + "..." + k[-4:]) if len(k) >= 8 else ("set" if k else "missing")
     return {
-        "infrared_key_configured": bool(os.getenv("INFRARED_API_KEY", "")),
+        "infrared_key_configured": bool(k),
+        "key_fingerprint": fp,
+        "key_len": len(k),
         "note": "Key stays on the backend. The browser never gets it.",
     }
 
