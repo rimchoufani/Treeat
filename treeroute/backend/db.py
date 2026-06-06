@@ -8,6 +8,7 @@ Storage-by-shape (slides' principle): the bulky result blob (UTCI grid + base64
 heatmap PNGs + GeoJSON) lives in the `results` JSON column; small summary fields
 are denormalised into their own columns so the list endpoint stays light.
 """
+import math
 import os
 from datetime import datetime
 
@@ -52,10 +53,24 @@ Base.metadata.create_all(engine)
 
 
 def _f(v, default=0.0):
+    """Coerce to a finite float — NaN/inf become the default (DBs reject NaN)."""
     try:
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return default
+    return f if math.isfinite(f) else default
+
+
+def _clean(obj):
+    """Recursively replace non-finite floats (NaN/inf) with None so the value
+    is valid JSON for both SQLite and Postgres (the UTCI grid has NaN cells)."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean(v) for v in obj]
+    return obj
 
 
 def save_analysis(job_id: str, polygon: dict, results: dict, label: str = "") -> None:
@@ -65,8 +80,8 @@ def save_analysis(job_id: str, polygon: dict, results: dict, label: str = "") ->
         id=job_id,
         created_at=datetime.utcnow(),
         label=label,
-        polygon=polygon,
-        results=results,
+        polygon=_clean(polygon),
+        results=_clean(results),
         utci_mean=_f(stats.get("utci_mean")),
         utci_after_mean=_f(stats.get("utci_after_mean")),
         total_trees=int(_f(stats.get("total_trees"))),
