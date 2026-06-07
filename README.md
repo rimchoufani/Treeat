@@ -34,6 +34,7 @@ Simulate UTCI  →  Score streets by cooling potential  →  Route through the c
 | **Cool route** | A-to-B pedestrian routing weighted by cumulative thermal exposure, not distance |
 | **Before / after** | Thermal map pre- and post-tree planting to validate the intervention |
 | **Species scoring** | Ranks species by cooling efficiency minus allergy/VOC penalty per location |
+| **Saved analyses** | Every completed analysis is persisted to a database — survives page refresh and redeploys |
 
 ---
 
@@ -76,6 +77,7 @@ LEOPOLDSTADT_POLYGON = {
 | Buildings | OSM + TUM heights via `client.buildings.get_area()` |
 | Ground materials | Mapbox via `client.ground_materials.get_area()` |
 | Backend | FastAPI + Uvicorn |
+| Persistence | SQLAlchemy → Neon Postgres (prod) / SQLite (local) |
 
 ---
 
@@ -315,6 +317,23 @@ def score_street(segment, utci_grid, bounds):
 | `GET` | `/route?from=lng,lat&to=lng,lat` | Find coolest pedestrian route between two points |
 | `GET` | `/budget?trees=N` | Return top N planting locations by cooling ROI |
 | `GET` | `/species?location=lng,lat` | Rank species by cooling score minus allergy/VOC penalty |
+| `GET` | `/api/saved` | List all persisted analyses (summary only) |
+| `GET` | `/api/saved/{id}` | Reload a full saved analysis — redraws map, re-enables budget + PDF |
+| `DELETE` | `/api/saved/{id}` | Delete a saved analysis |
+
+### Persistence (Day-2 requirement: data survives a refresh)
+
+Completed analyses are written to a database via SQLAlchemy (`backend/db.py`). The
+backend reads a `DATABASE_URL` environment variable:
+
+- **In production** → **Neon Postgres** (cloud database). Data survives both page
+  refreshes and backend redeploys.
+- **Locally (no `DATABASE_URL`)** → falls back to a SQLite file automatically, so
+  the app runs with zero setup during development.
+
+The bulky result blob (UTCI grid, heatmap PNGs, route GeoJSON) is stored in a JSON
+column; small summary fields (tree count, mean UTCI) are denormalised into their
+own columns so the list view stays light.
 
 ---
 
@@ -324,6 +343,7 @@ def score_street(segment, utci_grid, bounds):
 treeroute/
 ├── backend/
 │   ├── main.py              # FastAPI app
+│   ├── db.py                # SQLAlchemy persistence — Neon Postgres / SQLite fallback
 │   ├── simulate.py          # Infrared SDK — UTCI + TCS runs
 │   ├── routing.py           # OSMnx graph + UTCI-weighted Dijkstra
 │   ├── budget.py            # Tree budget optimizer
@@ -350,23 +370,41 @@ treeroute/
 ## Environment variables
 
 ```bash
-# backend/.env
-INFRARED_API_KEY=your_key_here
+# backend/.env  (gitignored — never commit this file)
+INFRARED_API_KEY=your_key_here          # secret — backend only
+ALLOWED_ORIGINS=http://localhost:5173   # comma-separated frontend URLs, never "*"
+DATABASE_URL=                           # optional — Neon Postgres in prod; blank → local SQLite
 ```
 
-The SDK reads `INFRARED_API_KEY` from the environment automatically.
+```bash
+# frontend/.env
+VITE_API_URL=                           # PUBLIC — the backend URL, baked into the browser bundle
+```
+
+The SDK reads `INFRARED_API_KEY` from the environment automatically. **The key is a
+backend secret — it lives only on the server (Railway Variables) and in the local
+gitignored `.env`, never in the frontend.** `VITE_API_URL` is public by design (it
+ships in the browser bundle), so it holds a URL, never a secret.
 
 ---
 
 ## Deploy (laptop → live URL)
 
-Track: **backend on Railway · frontend on Vercel** (no database — jobs are in-memory, data is static files).
+Track: **backend on Railway · frontend on Vercel · database on Neon Postgres**. (The
+course-suggested stack is Vercel + Render + Neon; Railway is the equivalent of Render.)
+
+**Database — Neon**
+1. [neon.tech](https://neon.tech) → New Project → copy the connection string (`postgresql://…`).
+2. Paste it into Railway as the `DATABASE_URL` variable (next step). The table is created automatically on first run.
 
 **Backend — Railway**
 1. [railway.com](https://railway.com) → New Project → Deploy from GitHub repo.
 2. Service → Settings → **Root Directory = `treeroute/backend`**. Railway reads `railway.toml` for the start command (`uvicorn main:app`) and the `/health` check.
-3. Variables: `INFRARED_API_KEY` (your key) and `ALLOWED_ORIGINS` (fill in after the frontend deploys).
+3. Variables: `INFRARED_API_KEY` (your key), `DATABASE_URL` (the Neon string), and `ALLOWED_ORIGINS` (fill in after the frontend deploys).
 4. Settings → Networking → Generate Domain → open the URL + `/health` → `{"status":"ok"}`.
+
+> Changing a Railway Variable only takes effect after a **redeploy** — push a commit
+> or hit "Redeploy" so the new value is picked up.
 
 **Frontend — Vercel**
 1. [vercel.com](https://vercel.com) → Add New Project → import the repo.
@@ -379,7 +417,10 @@ Put the Vercel URL into Railway's `ALLOWED_ORIGINS`, then **redeploy the backend
 
 **The secret rule:** `INFRARED_API_KEY` lives only on the backend (Railway) and in local `.env` (gitignored). `VITE_API_URL` is public — it ships in the browser bundle, so it's a URL, never a secret.
 
-> Note: on free tiers the backend sleeps when idle and analysis jobs live in memory — a long-idle instance loses in-progress jobs. Fine for a live demo; warm it up before presenting.
+> Note: on free tiers the backend sleeps when idle, so an *in-progress* job can be
+> lost if the instance sleeps mid-run — warm it up before presenting. **Completed**
+> analyses are safe: they're persisted to Neon Postgres and survive sleeps, refreshes,
+> and redeploys.
 
 ---
 
